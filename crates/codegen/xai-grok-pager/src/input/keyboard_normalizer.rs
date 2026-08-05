@@ -5,7 +5,7 @@
 //! `KeyEvent`s in place so every downstream surface sees the canonical
 //! form.
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::terminal::ModifierDelivery;
 
@@ -62,12 +62,52 @@ impl<P: ModifierProbe> KeyboardNormalizer<P> {
     /// Upgrade a [`KeyEvent`] when a modifier is held but absent from the
     /// event. Returns `Some` only if the delivered event changed.
     pub fn rescue_key(&self, key: KeyEvent) -> Option<KeyEvent> {
+        // Never turn a key-release notification into a second shortcut press.
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+
+        // Some terminals expose control characters directly instead of a
+        // printable key plus CONTROL. Canonicalize the two control bytes used
+        // by global shortcuts before consulting terminal capability policy.
         if key.code == KeyCode::Char('\u{0002}') && key.modifiers.is_empty() {
             let mut out = key;
             out.code = KeyCode::Char('b');
             out.modifiers = KeyModifiers::CONTROL;
             return Some(out);
         }
+        if key.code == KeyCode::Char('\u{0016}') && key.modifiers.is_empty() {
+            let mut out = key;
+            out.code = KeyCode::Char('v');
+            out.modifiers = KeyModifiers::CONTROL;
+            return Some(out);
+        }
+
+        // Several terminal/OS combinations report Ctrl+V or Cmd+V as an
+        // uppercase character without setting SHIFT. The generic shortcut
+        // matcher interprets uppercase as shifted, which incorrectly routes a
+        // normal paste to Ctrl/Cmd+Shift+V. Preserve explicit Shift, but
+        // canonicalize the unshifted uppercase representation.
+        if key.code == KeyCode::Char('V')
+            && (key.modifiers == KeyModifiers::CONTROL
+                || key.modifiers == KeyModifiers::SUPER)
+        {
+            let mut out = key;
+            out.code = KeyCode::Char('v');
+            return Some(out);
+        }
+
+        // Shift+Insert is the terminal-standard paste chord on Linux and is
+        // also emitted by a number of Windows terminal profiles. Convert it to
+        // the application's canonical paste shortcut so every prompt surface
+        // follows the same text/image/file routing path.
+        if key.code == KeyCode::Insert && key.modifiers == KeyModifiers::SHIFT {
+            let mut out = key;
+            out.code = KeyCode::Char('v');
+            out.modifiers = KeyModifiers::CONTROL;
+            return Some(out);
+        }
+
         if !self.delivery.benefits_from_rescue() {
             return None;
         }
@@ -143,20 +183,92 @@ mod tests {
         KeyboardNormalizer::new(MockProbe(state), delivery)
     }
 
+    fn native() -> ModifierDelivery {
+        ModifierDelivery::new_for_test(ModifierFate::Native, ModifierFate::Native)
+    }
+
     fn bare(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
     fn raw_ctrl_b_canonicalizes_without_modifier_probe() {
-        let native = ModifierDelivery::new_for_test(ModifierFate::Native, ModifierFate::Native);
-        let n = make(ModifierState::default(), native);
+        let n = make(ModifierState::default(), native());
         let raw = KeyEvent::new(KeyCode::Char('\u{0002}'), KeyModifiers::NONE);
         let out = n.rescue_key(raw).expect("raw Ctrl+B must canonicalize");
         assert_eq!(out.code, KeyCode::Char('b'));
         assert_eq!(out.modifiers, KeyModifiers::CONTROL);
         assert!(!crate::input::key::is_text_input_key(&out));
         assert!(crate::key!('b', CONTROL).matches(&out));
+    }
+
+    #[test]
+    fn raw_ctrl_v_canonicalizes_to_normal_paste() {
+        let n = make(ModifierState::default(), native());
+        let raw = KeyEvent::new(KeyCode::Char('\u{0016}'), KeyModifiers::NONE);
+        let out = n.rescue_key(raw).expect("raw Ctrl+V must canonicalize");
+        assert_eq!(out.code, KeyCode::Char('v'));
+        assert_eq!(out.modifiers, KeyModifiers::CONTROL);
+        assert!(crate::input::key::is_paste_key(&out));
+        assert!(!crate::input::key::is_inline_paste_key(&out));
+    }
+
+    #[test]
+    fn uppercase_ctrl_v_without_shift_canonicalizes_to_normal_paste() {
+        let n = make(ModifierState::default(), native());
+        let key = KeyEvent::new(KeyCode::Char('V'), KeyModifiers::CONTROL);
+        let out = n
+            .rescue_key(key)
+            .expect("uppercase Ctrl+V must canonicalize");
+        assert_eq!(out.code, KeyCode::Char('v'));
+        assert_eq!(out.modifiers, KeyModifiers::CONTROL);
+        assert!(crate::input::key::is_paste_key(&out));
+        assert!(!crate::input::key::is_inline_paste_key(&out));
+    }
+
+    #[test]
+    fn uppercase_super_v_without_shift_canonicalizes_to_normal_paste() {
+        let n = make(ModifierState::default(), native());
+        let key = KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SUPER);
+        let out = n
+            .rescue_key(key)
+            .expect("uppercase Cmd+V must canonicalize");
+        assert_eq!(out.code, KeyCode::Char('v'));
+        assert_eq!(out.modifiers, KeyModifiers::SUPER);
+        assert!(crate::input::key::is_paste_key(&out));
+        assert!(!crate::input::key::is_inline_paste_key(&out));
+    }
+
+    #[test]
+    fn explicit_ctrl_shift_v_is_preserved_as_inline_paste() {
+        let n = make(ModifierState::default(), native());
+        let key = KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(n.rescue_key(key).is_none());
+        assert!(crate::input::key::is_inline_paste_key(&key));
+        assert!(!crate::input::key::is_paste_key(&key));
+    }
+
+    #[test]
+    fn shift_insert_canonicalizes_to_normal_paste() {
+        let n = make(ModifierState::default(), native());
+        let key = KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT);
+        let out = n
+            .rescue_key(key)
+            .expect("Shift+Insert must canonicalize");
+        assert_eq!(out.code, KeyCode::Char('v'));
+        assert_eq!(out.modifiers, KeyModifiers::CONTROL);
+        assert!(crate::input::key::is_paste_key(&out));
+    }
+
+    #[test]
+    fn paste_release_events_are_not_canonicalized() {
+        let n = make(ModifierState::default(), native());
+        let mut key = KeyEvent::new(KeyCode::Char('\u{0016}'), KeyModifiers::NONE);
+        key.kind = KeyEventKind::Release;
+        assert!(n.rescue_key(key).is_none());
     }
 
     #[test]
