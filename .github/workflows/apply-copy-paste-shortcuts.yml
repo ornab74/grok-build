@@ -1,0 +1,155 @@
+name: Apply copy and paste shortcuts
+
+on:
+  push:
+    branches:
+      - feature/copy-paste-shortcuts
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/copy-paste-shortcuts
+          fetch-depth: 0
+
+      - name: Apply focused clipboard patch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          selection_path = Path('crates/codegen/xai-grok-pager/src/app/agent_view/selection.rs')
+          selection = selection_path.read_text()
+          marker = "    pub(in crate::app) fn begin_pending_block_drag(&mut self, mouse: &MouseEvent) -> bool {\n"
+          method = r'''    /// Copy the currently highlighted transcript selection again.
+    ///
+    /// Mouse selection already copies on release; this helper lets Ctrl/Cmd+C
+    /// and right-click restore that selection after another program replaces
+    /// the system clipboard. Returns `false` when there is no reconstructable
+    /// selection so callers can preserve their existing fallback behavior.
+    pub(in crate::app) fn copy_persistent_text_selection_to_clipboard(&mut self) -> bool {
+        let Some(selection) = self.persistent_text_selection else {
+            return false;
+        };
+        let anchor = RangeHit {
+            entry_idx: selection.entry_idx,
+            range_id: selection.range_id,
+            block_line_idx: selection.anchor.block_line_idx,
+            col_within_range: selection.anchor.col_within_range,
+        };
+        let head = RangeHit {
+            entry_idx: selection.entry_idx,
+            range_id: selection.range_id,
+            block_line_idx: selection.head.block_line_idx,
+            col_within_range: selection.head.col_within_range,
+        };
+        let anchor_content_width = if anchor.entry_idx == BTW_OVERLAY_ENTRY_IDX {
+            Some(self.last_btw_area.width.saturating_sub(4))
+        } else {
+            self.selection_model_for_hit(&anchor)
+                .visible_block_content_width(anchor.entry_idx)
+        };
+        let drag = ActiveTextDrag {
+            anchor,
+            head,
+            kind: selection.kind,
+            anchor_content_width,
+        };
+        let Some((text, _)) = self.reconstruct_drag_copy(&drag) else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        self.copy_to_clipboard(&text);
+        true
+    }
+
+'''
+          if 'fn copy_persistent_text_selection_to_clipboard' not in selection:
+              if marker not in selection:
+                  raise SystemExit('selection insertion marker not found')
+              selection = selection.replace(marker, method + marker, 1)
+              selection_path.write_text(selection)
+
+          mouse_path = Path('crates/codegen/xai-grok-pager/src/app/mouse.rs')
+          mouse = mouse_path.read_text()
+          old = "        match mouse.kind {\n            MouseEventKind::Down(MouseButton::Left) => {\n"
+          new = r'''        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.pane_areas.hit_test(mouse.column, mouse.row) == Some(AgentPane::Prompt) {
+                    self.set_active_pane(AgentPane::Prompt, false);
+                    self.btw_focused = false;
+                    return self.handle_paste_key_deferred(
+                        crate::app::actions::ClipboardTextRead::Success(
+                            crate::clipboard::system_clipboard_get(),
+                        ),
+                    );
+                }
+                if self.copy_persistent_text_selection_to_clipboard() {
+                    return InputOutcome::Changed;
+                }
+                InputOutcome::Unchanged
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+'''
+          if 'MouseEventKind::Down(MouseButton::Right)' not in mouse:
+              if old not in mouse:
+                  raise SystemExit('mouse insertion marker not found')
+              mouse = mouse.replace(old, new, 1)
+              mouse_path.write_text(mouse)
+
+          input_path = Path('crates/codegen/xai-grok-pager/src/app/agent_view/input.rs')
+          input_text = input_path.read_text()
+          old = r'''        let outcome = match ev {
+'''
+          new = r'''        // A highlighted transcript owns Ctrl/Cmd+C. When no selection can be
+        // reconstructed, fall through to the existing CancelTurn shortcut.
+        if let Event::Key(key) = ev
+            && key.kind != KeyEventKind::Release
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER))
+            && !crate::input::key::is_altgr(key.modifiers)
+            && self.copy_persistent_text_selection_to_clipboard()
+        {
+            return InputOutcome::Changed;
+        }
+        let outcome = match ev {
+'''
+          if 'A highlighted transcript owns Ctrl/Cmd+C' not in input_text:
+              tip_anchor = "        if let Event::Key(key) = ev\n            && key.kind != KeyEventKind::Release\n            && key!('y', CONTROL).matches(key)\n"
+              start = input_text.find(tip_anchor)
+              if start < 0:
+                  raise SystemExit('input context marker not found')
+              pos = input_text.find(old, start)
+              if pos < 0:
+                  raise SystemExit('input insertion marker not found')
+              input_text = input_text[:pos] + new + input_text[pos + len(old):]
+              input_path.write_text(input_text)
+          PY
+
+      - name: Format and test pager crate
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo test -p xai-grok-pager --lib agent_view --no-default-features
+
+      - name: Commit feature and remove one-shot workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/apply-copy-paste-shortcuts.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/codegen/xai-grok-pager/src/app/agent_view/input.rs \
+                  crates/codegen/xai-grok-pager/src/app/agent_view/selection.rs \
+                  crates/codegen/xai-grok-pager/src/app/mouse.rs \
+                  .github/workflows/apply-copy-paste-shortcuts.yml
+          git commit -m "feat: add keyboard and right-click clipboard actions"
+          git push origin HEAD:feature/copy-paste-shortcuts
